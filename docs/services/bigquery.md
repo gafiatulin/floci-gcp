@@ -82,11 +82,26 @@ REST paths live under `/bigquery/v2/projects/{project}/...`.
   Copy references are currently limited to the project that owns the job.
 - **Query parameters**: `parameterMode` `NAMED` (`@name`) and `POSITIONAL` (`?`), with scalar,
   `ARRAY` and `STRUCT` parameter types.
+- **Scripts and temporary objects**: request-scoped `CREATE TEMP FUNCTION` and `CREATE TEMP TABLE`
+  declarations can be interleaved with queries in source order. Functions become temporary
+  DuckDB macros; typed scalar, array and nested `STRUCT` parameters are accepted, and CTEs in a
+  function body remain local to that body. Temporary tables accept an explicit schema, an `AS`
+  query, or both, and can be explicitly addressed through the `_SESSION` qualifier. Preceding query
+  results are discarded and the final query or DML statement supplies the result. Procedural
+  `IF`/`ELSEIF`/`ELSE` blocks are evaluated with the same temporary objects and execute only their
+  selected branch. Supported persistent DML and DDL statements execute in source order. A sequence
+  of temporary function declarations followed by one query remains a single query, as in BigQuery.
+  Variables, loops, JavaScript UDFs, and positional parameters in multi-statement scripts are not
+  supported. Multi-statement queries reject destination, disposition, schema update, partitioning,
+  clustering, destination encryption, and user-defined function resource configuration fields.
 - **Dry runs**: `dryRun` on `jobs.query` or `configuration.dryRun` on `jobs.insert` validates the
   query and returns its result schema (`statistics.query.schema` on the job) and
   `totalBytesProcessed`, without running it or persisting a job. An invalid query in a dry run is
   an HTTP 400. DML and DDL dry runs resolve every table the statement reads or writes, and DML is
-  bound against those tables, so a dry run fails wherever the real run would.
+  bound against those tables, so a dry run fails wherever the real run would. A script dry run
+  stops before an `IF` condition without validating its branches or following statements, and
+  stops after validating the first DDL statement.
+  `CREATE TEMP TABLE` is not supported in a dry run, matching BigQuery.
 - **Destination tables**: `jobs.insert` honors `configuration.query.destinationTable` with
   `createDisposition` (`CREATE_IF_NEEDED` default, `CREATE_NEVER`) and `writeDisposition`
   (`WRITE_EMPTY` default, `WRITE_TRUNCATE`, `WRITE_TRUNCATE_DATA`, `WRITE_APPEND`). Failures are
@@ -493,8 +508,11 @@ literal   := 'string' | "string" | integer | float | TRUE | FALSE
 
 ## Deviations from real BigQuery
 
-- Multi-statement scripts, temporary tables, `ALTER TABLE` / `ALTER VIEW`, `CREATE FUNCTION` /
-  `PROCEDURE`, `EXPORT DATA` and `LOAD DATA` are not supported yet; they fail with `invalidQuery`.
+- Scripts support temporary SQL functions and tables plus `IF`/`ELSEIF`/`ELSE`. Variables,
+  loops, JavaScript UDFs, persistent `CREATE FUNCTION` / `PROCEDURE`, `EXPORT DATA`, `LOAD DATA`,
+  `ALTER TABLE`, and `ALTER VIEW` are not supported; they fail with `invalidQuery`.
+- Script statements execute synchronously within the parent job. Separate child jobs are not
+  created or returned by `jobs.list`.
 - DML statements are applied atomically per statement by reading and rewriting the whole target
   table; there is no fine-grained DML or streaming-buffer interaction.
 - `CLUSTER BY` and table `OPTIONS` in DDL are not stored. Time-based `PARTITION BY` metadata is

@@ -44,6 +44,7 @@ import java.time.format.ResolverStyle;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -668,10 +669,22 @@ public class BigQueryService {
                                String parameterMode, boolean dryRun, Boolean useLegacySql,
                                TableReference destinationTable, String writeDisposition,
                                String createDisposition, List<String> schemaUpdateOptions,
-                               Map<String, Object> timePartitioning, Map<String, Object> rangePartitioning) {
+                               Map<String, Object> timePartitioning, Map<String, Object> rangePartitioning,
+                               Set<String> scriptIncompatibleOptions) {
 
         public QueryOptions {
             schemaUpdateOptions = schemaUpdateOptions != null ? schemaUpdateOptions : List.of();
+            scriptIncompatibleOptions = scriptIncompatibleOptions != null ? scriptIncompatibleOptions : Set.of();
+        }
+
+        public QueryOptions(String sql, String defaultDatasetId, List<Map<String, Object>> queryParameters,
+                            String parameterMode, boolean dryRun, Boolean useLegacySql,
+                            TableReference destinationTable, String writeDisposition,
+                            String createDisposition, List<String> schemaUpdateOptions,
+                            Map<String, Object> timePartitioning, Map<String, Object> rangePartitioning) {
+            this(sql, defaultDatasetId, queryParameters, parameterMode, dryRun, useLegacySql, destinationTable,
+                    writeDisposition, createDisposition, schemaUpdateOptions, timePartitioning, rangePartitioning,
+                    Set.of());
         }
 
         public QueryOptions(String sql, String defaultDatasetId, List<Map<String, Object>> queryParameters,
@@ -679,7 +692,7 @@ public class BigQueryService {
                             TableReference destinationTable, String writeDisposition, String createDisposition,
                             List<String> schemaUpdateOptions) {
             this(sql, defaultDatasetId, queryParameters, parameterMode, dryRun, useLegacySql, destinationTable,
-                    writeDisposition, createDisposition, schemaUpdateOptions, null, null);
+                    writeDisposition, createDisposition, schemaUpdateOptions, null, null, Set.of());
         }
 
         public QueryOptions(String sql, String defaultDatasetId, List<Map<String, Object>> queryParameters,
@@ -745,8 +758,22 @@ public class BigQueryService {
             throw QueryEngine.invalidQuery("Legacy SQL is not supported by the floci BigQuery emulator;"
                     + " set useLegacySql to false to run GoogleSQL.");
         }
-        SqlDialectTranslator.Statement statement = SqlDialectTranslator.parseStatement(options.sql(), projectId,
-                options.defaultDatasetId());
+        boolean script = SqlDialectTranslator.multiStatementScript(options.sql());
+        SqlDialectTranslator.ProceduralScript procedural = script
+                ? SqlDialectTranslator.proceduralScript(options.sql()) : null;
+        if (script) {
+            validateScriptConfiguration(options);
+        }
+        if (script && "POSITIONAL".equalsIgnoreCase(options.parameterMode())) {
+            throw QueryEngine.invalidQuery(
+                    "Positional query parameters are not supported in multi-statement scripts.");
+        }
+        if (procedural != null) {
+            validateProceduralStatements(projectId, procedural, options.defaultDatasetId());
+        }
+        SqlDialectTranslator.Statement statement = procedural == null
+                ? SqlDialectTranslator.scriptFinalStatement(options.sql(), projectId, options.defaultDatasetId())
+                : null;
 
         StoredJob job = new StoredJob();
         job.setJobId(resolvedJobId);
@@ -755,20 +782,44 @@ public class BigQueryService {
         job.setQuery(options.sql());
         job.setState("DONE");
         job.setCreationTime(nowMillis());
-        job.setStatementType(statement.statementType());
+        job.setStatementType(procedural == null ? statement.statementType() : "SCRIPT");
         job.setTotalBytesProcessed("0");
+
+        if (procedural != null) {
+            if (options.dryRun()) {
+                ProceduralContext context = validateProceduralScript(
+                        projectId, procedural, options, jobLocation);
+                BigQuerySqlEngine.Result result = context.lastQueryResult();
+                if (result != null) {
+                    job.setSchema(result.schema());
+                }
+                job.setTotalBytesProcessed(String.valueOf(context.totalBytesProcessed()));
+                job.setLocation(jobLocation.resolved());
+                job.setDryRun(true);
+                return job;
+            }
+            synchronized (writeLock) {
+                executeProceduralScript(projectId, procedural, options, job, jobLocation);
+            }
+            job.setLocation(jobLocation.resolved());
+            jobStore.put(job.getJobId(), job);
+            return job;
+        }
 
         if (statement.kind() != SqlDialectTranslator.StatementKind.QUERY) {
             if (options.dryRun()) {
                 // "an invalid query will return the same error it would if it wasn't a dry run", so
                 // a dry run has to resolve what the statement touches rather than only classify it.
-                validateStatement(projectId, statement, options, jobLocation);
+                long totalBytesProcessed = validateStatement(projectId, statement, options, jobLocation);
+                job.setTotalBytesProcessed(String.valueOf(totalBytesProcessed));
+                job.setLocation(jobLocation.resolved());
                 job.setDryRun(true);
                 return job;
             }
             synchronized (writeLock) {
                 executeStatement(projectId, statement, options, job, jobLocation);
             }
+            job.setLocation(jobLocation.resolved());
             jobStore.put(job.getJobId(), job);
             return job;
         }
@@ -833,13 +884,16 @@ public class BigQueryService {
      * reports the same error a real run would, so a DML statement against a missing target or
      * source table, or a CREATE VIEW over a missing one, fails here instead of reporting success.
      */
-    private void validateStatement(String projectId, SqlDialectTranslator.Statement statement,
+    private long validateStatement(String projectId, SqlDialectTranslator.Statement statement,
                                    QueryOptions options, JobLocation jobLocation) {
         SqlDialectTranslator.TableRef target = statement.target();
+        long totalBytesProcessed = 0;
         switch (statement.kind()) {
             case INSERT, UPDATE, DELETE, MERGE -> {
                 getTable(projectId, target.datasetId(), target.tableId());
-                engine.executeDml(request(projectId, options.sql(), options, true), tables(projectId, jobLocation));
+                BigQuerySqlEngine.DmlResult result = engine.executeDml(
+                        request(projectId, options.sql(), options, true), tables(projectId, jobLocation));
+                totalBytesProcessed = result.totalBytesProcessed();
             }
             case TRUNCATE -> getTable(projectId, target.datasetId(), target.tableId());
             case DROP_TABLE, DROP_VIEW -> {
@@ -868,6 +922,7 @@ public class BigQueryService {
                 } else if (statement.querySql() != null) {
                     described = engine.execute(request(projectId, statement.querySql(), options, true),
                             tables(projectId, jobLocation));
+                    totalBytesProcessed = described.totalBytesProcessed();
                 }
                 if (statement.kind() == SqlDialectTranslator.StatementKind.CREATE_TABLE
                         && statement.copySource() == null) {
@@ -895,6 +950,420 @@ public class BigQueryService {
             }
             default -> { }
         }
+        return totalBytesProcessed;
+    }
+
+    private ProceduralContext validateProceduralScript(String projectId,
+                                                        SqlDialectTranslator.ProceduralScript script,
+                                                        QueryOptions options, JobLocation jobLocation) {
+        ProceduralContext context = new ProceduralContext();
+        for (SqlDialectTranslator.ScriptItem item : script.items()) {
+            if (item instanceof SqlDialectTranslator.IfBlock) {
+                break;
+            }
+            if (!validateProceduralItem(projectId, item, options, context, jobLocation)) {
+                break;
+            }
+        }
+        return context;
+    }
+
+    private static void validateProceduralStatements(String projectId,
+                                                     SqlDialectTranslator.ProceduralScript script,
+                                                     String defaultDatasetId) {
+        validateProceduralItems(projectId, script.items(), defaultDatasetId, new LinkedHashSet<>());
+    }
+
+    private static Set<String> validateProceduralItems(String projectId,
+                                                       List<SqlDialectTranslator.ScriptItem> items,
+                                                       String defaultDatasetId, Set<String> temporaryTables) {
+        Set<String> current = new LinkedHashSet<>(temporaryTables);
+        for (SqlDialectTranslator.ScriptItem item : items) {
+            if (item instanceof SqlDialectTranslator.SqlItem sql) {
+                SqlDialectTranslator.validateProceduralStatement(
+                        sql.sql(), projectId, defaultDatasetId, current);
+                SqlDialectTranslator.TemporaryTableDefinition declaration =
+                        SqlDialectTranslator.temporaryTableDefinition(sql.sql());
+                if (declaration != null) {
+                    current.add(declaration.name());
+                    continue;
+                }
+                SqlDialectTranslator.TemporaryTableDrop drop =
+                        SqlDialectTranslator.temporaryTableDrop(sql.sql());
+                if (drop != null && current.contains(drop.name())) {
+                    current.remove(drop.name());
+                }
+                continue;
+            }
+            SqlDialectTranslator.IfBlock conditional = (SqlDialectTranslator.IfBlock) item;
+            SqlDialectTranslator.validateProceduralStatement(
+                    "SELECT " + conditional.condition(), projectId, defaultDatasetId, current);
+            Set<String> whenTrue = validateProceduralItems(
+                    projectId, conditional.whenTrue(), defaultDatasetId, current);
+            Set<String> whenFalse = validateProceduralItems(
+                    projectId, conditional.whenFalse(), defaultDatasetId, current);
+            current.clear();
+            current.addAll(whenTrue);
+            current.addAll(whenFalse);
+        }
+        return current;
+    }
+
+    private boolean validateProceduralItem(String projectId, SqlDialectTranslator.ScriptItem item,
+                                           QueryOptions options, ProceduralContext context,
+                                           JobLocation jobLocation) {
+        if (item instanceof SqlDialectTranslator.SqlItem sql) {
+            SqlDialectTranslator.TemporaryTableDefinition temporaryTable =
+                    SqlDialectTranslator.temporaryTableDefinition(sql.sql());
+            if (temporaryTable != null) {
+                throw QueryEngine.invalidQuery("Dry runs of CREATE TEMP TABLE statements are not supported.");
+            }
+            String truncatedTemporaryTable = SqlDialectTranslator.temporaryTruncateTarget(
+                    sql.sql(), context.temporaryTables());
+            if (truncatedTemporaryTable != null) {
+                context.truncateTemporaryTable(truncatedTemporaryTable);
+                return true;
+            }
+            String temporaryTarget = SqlDialectTranslator.temporaryDmlTarget(sql.sql(), context.temporaryTables());
+            if (temporaryTarget != null) {
+                materializeTemporaryTable(projectId, sql.sql(), temporaryTarget, List.of(), options, context,
+                        jobLocation, true);
+                return true;
+            }
+            validateTemporaryFunctionDeclaration(projectId, sql.sql(), options, context);
+            if (context.applyTemporaryObjectChange(sql.sql())) {
+                return true;
+            }
+            SqlDialectTranslator.Statement statement = SqlDialectTranslator.parseStatement(sql.sql(), projectId,
+                    options.defaultDatasetId());
+            String effectiveSql = context.prependTo(sql.sql());
+            statement = withTemporarySetup(statement, context);
+            if (statement.kind() == SqlDialectTranslator.StatementKind.QUERY) {
+                BigQuerySqlEngine.Result result = engine.execute(
+                        request(projectId, effectiveSql, options, true), tables(projectId, jobLocation));
+                context.recordQueryResult(result);
+            } else {
+                context.recordBytes(validateStatement(
+                        projectId, statement, leafOptions(effectiveSql, options), jobLocation));
+                context.clearQueryResult();
+            }
+            return statement.kind() == SqlDialectTranslator.StatementKind.QUERY || statement.isDml();
+        }
+        throw new IllegalStateException("Procedural dry-run validation must stop before control flow");
+    }
+
+    private void executeProceduralScript(String projectId, SqlDialectTranslator.ProceduralScript script,
+                                         QueryOptions options, StoredJob job, JobLocation jobLocation) {
+        ProceduralContext context = new ProceduralContext();
+        for (SqlDialectTranslator.ScriptItem item : script.items()) {
+            executeProceduralItem(projectId, item, options, job, context, jobLocation);
+        }
+        BigQuerySqlEngine.Result result = context.lastQueryResult();
+        job.setTotalBytesProcessed(String.valueOf(context.totalBytesProcessed()));
+        if (result != null) {
+            job.setTotalRows(result.rows().size());
+            job.setDestinationDatasetId(ANON_DATASET);
+            job.setDestinationTableId("anon_" + job.getJobId());
+            materializeResult(projectId, job, result.schema(), result.rows());
+        }
+    }
+
+    private static void validateScriptConfiguration(QueryOptions options) {
+        if (options.destinationTable() != null || options.writeDisposition() != null
+                || options.createDisposition() != null || !options.schemaUpdateOptions().isEmpty()
+                || options.timePartitioning() != null || options.rangePartitioning() != null
+                || !options.scriptIncompatibleOptions().isEmpty()) {
+            throw QueryEngine.invalidQuery("Destination, disposition, schema update, partitioning, clustering, "
+                    + "encryption, and user-defined function resource options cannot be set for multi-statement "
+                    + "queries.");
+        }
+    }
+
+    private void executeProceduralItem(String projectId, SqlDialectTranslator.ScriptItem item, QueryOptions options,
+                                       StoredJob job, ProceduralContext context, JobLocation jobLocation) {
+        clearStatementStatistics(job);
+        if (item instanceof SqlDialectTranslator.SqlItem sql) {
+            SqlDialectTranslator.TemporaryTableDefinition temporaryTable =
+                    SqlDialectTranslator.temporaryTableDefinition(sql.sql());
+            if (temporaryTable != null) {
+                if (temporaryTable.ifNotExists() && context.temporaryTables().contains(temporaryTable.name())) {
+                    context.clearQueryResult();
+                    return;
+                }
+                materializeTemporaryTable(projectId, sql.sql(), temporaryTable.name(), temporaryTable.fields(),
+                        options, context, jobLocation, false);
+                return;
+            }
+            String truncatedTemporaryTable = SqlDialectTranslator.temporaryTruncateTarget(
+                    sql.sql(), context.temporaryTables());
+            if (truncatedTemporaryTable != null) {
+                long removed = context.truncateTemporaryTable(truncatedTemporaryTable);
+                job.setDmlStats(Map.of("deletedRowCount", String.valueOf(removed)));
+                return;
+            }
+            String temporaryTarget = SqlDialectTranslator.temporaryDmlTarget(sql.sql(), context.temporaryTables());
+            if (temporaryTarget != null) {
+                materializeTemporaryDml(projectId, sql.sql(), temporaryTarget, options, context, jobLocation, job);
+                return;
+            }
+            validateTemporaryFunctionDeclaration(projectId, sql.sql(), options, context);
+            if (context.applyTemporaryObjectChange(sql.sql())) {
+                return;
+            }
+            SqlDialectTranslator.Statement statement = SqlDialectTranslator.parseStatement(sql.sql(), projectId,
+                    options.defaultDatasetId());
+            QueryOptions leaf = leafOptions(context.prependTo(sql.sql()), options);
+            statement = withTemporarySetup(statement, context);
+            if (statement.kind() == SqlDialectTranslator.StatementKind.QUERY) {
+                BigQuerySqlEngine.Result result = engine.execute(
+                        request(projectId, leaf.sql(), leaf, false), tables(projectId, jobLocation));
+                context.recordQueryResult(result);
+            } else {
+                job.setTotalBytesProcessed("0");
+                executeStatement(projectId, statement, leaf, job, jobLocation);
+                context.recordBytes(Long.parseLong(job.getTotalBytesProcessed()));
+                context.clearQueryResult();
+            }
+            return;
+        }
+        SqlDialectTranslator.IfBlock conditional = (SqlDialectTranslator.IfBlock) item;
+        BigQuerySqlEngine.Result result = engine.execute(request(projectId,
+                context.prependTo("SELECT " + conditional.condition() + " AS _floci_condition"), options, false),
+                tables(projectId, jobLocation));
+        context.recordBytes(result.totalBytesProcessed());
+        List<TableFieldSchema> conditionFields = result.schema() != null && result.schema().getFields() != null
+                ? result.schema().getFields() : List.of();
+        if (conditionFields.size() != 1
+                || !"BOOLEAN".equalsIgnoreCase(conditionFields.getFirst().getType())) {
+            throw QueryEngine.invalidQuery("IF condition must be a BOOL expression");
+        }
+        boolean matches = !result.rows().isEmpty()
+                && Boolean.TRUE.equals(result.rows().getFirst().get("_floci_condition"));
+        context.clearQueryResult();
+        for (SqlDialectTranslator.ScriptItem branch : matches ? conditional.whenTrue() : conditional.whenFalse()) {
+            executeProceduralItem(projectId, branch, options, job, context, jobLocation);
+        }
+    }
+
+    private static void validateTemporaryFunctionDeclaration(String projectId, String sql, QueryOptions options,
+                                                               ProceduralContext context) {
+        SqlDialectTranslator.validateTemporaryFunctionDeclaration(sql, projectId, options.defaultDatasetId(),
+                new SqlDialectTranslator.QueryParameters(options.queryParameters(), options.parameterMode()),
+                context.temporaryTables());
+    }
+
+    private void materializeTemporaryTable(String projectId, String sql, String name,
+                                           List<TableFieldSchema> declaredFields, QueryOptions options,
+                                           ProceduralContext context, JobLocation jobLocation, boolean dryRun) {
+        String snapshot = context.prependTo(sql + ";\nSELECT * FROM " + googleIdentifier(name));
+        QueryOptions leaf = leafOptions(snapshot, options);
+        BigQuerySqlEngine.Result result = engine.execute(request(projectId, leaf.sql(), leaf, dryRun),
+                tables(projectId, jobLocation));
+        context.recordBytes(result.totalBytesProcessed());
+        if (!declaredFields.isEmpty()) {
+            result = new BigQuerySqlEngine.Result(new TableSchema(declaredFields), result.rows(),
+                    result.statementType(), result.totalBytesProcessed());
+        }
+        context.materializeTemporaryTable(name, result);
+    }
+
+    private void materializeTemporaryDml(String projectId, String sql, String name, QueryOptions options,
+                                         ProceduralContext context, JobLocation jobLocation, StoredJob job) {
+        QueryOptions leaf = leafOptions(context.prependTo(sql), options);
+        BigQuerySqlEngine.Result existing = context.temporaryTableResult(name);
+        List<TableFieldSchema> targetFields = existing.schema() != null && existing.schema().getFields() != null
+                ? existing.schema().getFields() : List.of();
+        BigQuerySqlEngine.TemporaryDmlResult result = engine.executeTemporaryDml(
+                request(projectId, leaf.sql(), leaf, false), tables(projectId, jobLocation), name, targetFields);
+        BigQuerySqlEngine.DmlResult dml = result.dmlResult();
+        context.recordBytes(dml.totalBytesProcessed());
+        context.materializeTemporaryTable(name, new BigQuerySqlEngine.Result(result.schema(), dml.tableRows(),
+                "SELECT", dml.totalBytesProcessed()));
+        SqlDialectTranslator.Statement statement = SqlDialectTranslator.parseStatement(sql, projectId,
+                options.defaultDatasetId() != null ? options.defaultDatasetId() : "_floci_temporary",
+                context.temporaryTables());
+        recordDmlStatistics(job, statement.kind(), dml);
+    }
+
+    private static SqlDialectTranslator.Statement withTemporarySetup(SqlDialectTranslator.Statement statement,
+                                                                     ProceduralContext context) {
+        if (statement.kind() == SqlDialectTranslator.StatementKind.CREATE_TABLE && statement.querySql() != null) {
+            return statement.withQuerySql(context.prependTo(statement.querySql()));
+        }
+        return statement;
+    }
+
+    private static String materializedTemporaryTable(String name, BigQuerySqlEngine.Result result) {
+        List<TableFieldSchema> fields = result.schema() != null && result.schema().getFields() != null
+                ? result.schema().getFields() : List.of();
+        StringBuilder sql = new StringBuilder("CREATE TEMP TABLE ").append(googleIdentifier(name)).append(" (");
+        for (int i = 0; i < fields.size(); i++) {
+            if (i > 0) {
+                sql.append(", ");
+            }
+            TableFieldSchema field = fields.get(i);
+            sql.append(googleIdentifier(field.getName())).append(' ').append(googleType(field));
+            if ("REQUIRED".equals(field.getMode())) {
+                sql.append(" NOT NULL");
+            }
+        }
+        sql.append(')');
+        if (result.rows().isEmpty()) {
+            return sql.toString();
+        }
+        sql.append(";\nINSERT INTO ").append(googleIdentifier(name)).append(" SELECT * FROM UNNEST([");
+        for (int rowIndex = 0; rowIndex < result.rows().size(); rowIndex++) {
+            if (rowIndex > 0) {
+                sql.append(", ");
+            }
+            Map<String, Object> row = result.rows().get(rowIndex);
+            sql.append("STRUCT(");
+            for (int fieldIndex = 0; fieldIndex < fields.size(); fieldIndex++) {
+                if (fieldIndex > 0) {
+                    sql.append(", ");
+                }
+                TableFieldSchema field = fields.get(fieldIndex);
+                sql.append(DuckTypes.storedLiteral(field, row.get(field.getName()))).append(" AS ")
+                        .append(googleIdentifier(field.getName()));
+            }
+            sql.append(')');
+        }
+        return sql.append("])").toString();
+    }
+
+    private static String googleType(TableFieldSchema field) {
+        String scalar = switch (field.getType().toUpperCase(Locale.ROOT)) {
+            case "INTEGER" -> "INT64";
+            case "FLOAT" -> "FLOAT64";
+            case "BOOLEAN" -> "BOOL";
+            case "RECORD", "STRUCT" -> {
+                List<TableFieldSchema> children = field.getFields() != null ? field.getFields() : List.of();
+                List<String> members = new ArrayList<>();
+                for (TableFieldSchema child : children) {
+                    String member = googleIdentifier(child.getName()) + " " + googleType(child);
+                    if ("REQUIRED".equals(child.getMode())) {
+                        member += " NOT NULL";
+                    }
+                    members.add(member);
+                }
+                yield "STRUCT<" + String.join(", ", members) + ">";
+            }
+            default -> field.getType().toUpperCase(Locale.ROOT);
+        };
+        return "REPEATED".equals(field.getMode()) ? "ARRAY<" + scalar + ">" : scalar;
+    }
+
+    private static String googleIdentifier(String value) {
+        return '`' + value.replace("`", "\\`") + '`';
+    }
+
+    /** Request-local objects are replayed before each selected procedural leaf because every
+     * sidecar call owns a fresh in-memory DuckDB connection. */
+    private static final class ProceduralContext {
+        private final Map<String, String> setupObjects = new LinkedHashMap<>();
+        private final Set<String> temporaryTables = new LinkedHashSet<>();
+        private final Set<String> temporaryFunctions = new LinkedHashSet<>();
+        private final Map<String, BigQuerySqlEngine.Result> temporaryTableResults = new LinkedHashMap<>();
+        private long totalBytesProcessed;
+        private BigQuerySqlEngine.Result lastQueryResult;
+
+        private boolean applyTemporaryObjectChange(String sql) {
+            SqlDialectTranslator.TemporaryFunctionDefinition function =
+                    SqlDialectTranslator.temporaryFunctionDefinition(sql);
+            if (function != null) {
+                String normalized = function.name().toLowerCase(Locale.ROOT);
+                if (temporaryFunctions.contains(normalized)) {
+                    if (function.ifNotExists()) {
+                        clearQueryResult();
+                        return true;
+                    }
+                    if (!function.orReplace()) {
+                        throw QueryEngine.invalidQuery("Already Exists: Function " + function.name());
+                    }
+                    setupObjects.remove("function:" + normalized);
+                }
+                temporaryFunctions.add(normalized);
+                setupObjects.put("function:" + normalized, sql);
+                clearQueryResult();
+                return true;
+            }
+            SqlDialectTranslator.TemporaryTableDrop drop = SqlDialectTranslator.temporaryTableDrop(sql);
+            if (drop != null && temporaryTables.contains(drop.name())) {
+                temporaryTables.remove(drop.name());
+                setupObjects.remove("table:" + drop.name());
+                temporaryTableResults.remove(drop.name());
+                clearQueryResult();
+                return true;
+            }
+            if (drop != null && drop.sessionQualified()) {
+                if (!drop.ifExists()) {
+                    throw QueryEngine.invalidQuery("Temporary table _SESSION." + drop.name() + " was not found.");
+                }
+                clearQueryResult();
+                return true;
+            }
+            return false;
+        }
+
+        private void materializeTemporaryTable(String name, BigQuerySqlEngine.Result result) {
+            temporaryTables.add(name);
+            temporaryTableResults.put(name, result);
+            setupObjects.put("table:" + name, BigQueryService.materializedTemporaryTable(name, result));
+            clearQueryResult();
+        }
+
+        private long truncateTemporaryTable(String name) {
+            BigQuerySqlEngine.Result existing = temporaryTableResults.get(name);
+            if (existing == null) {
+                throw new IllegalStateException("Temporary table was not materialized: " + name);
+            }
+            long removed = existing.rows().size();
+            materializeTemporaryTable(name, new BigQuerySqlEngine.Result(
+                    existing.schema(), List.of(), existing.statementType(), existing.totalBytesProcessed()));
+            return removed;
+        }
+
+        private void recordQueryResult(BigQuerySqlEngine.Result result) {
+            recordBytes(result.totalBytesProcessed());
+            lastQueryResult = result;
+        }
+
+        private void recordBytes(long bytes) {
+            totalBytesProcessed += bytes;
+        }
+
+        private void clearQueryResult() {
+            lastQueryResult = null;
+        }
+
+        private BigQuerySqlEngine.Result lastQueryResult() {
+            return lastQueryResult;
+        }
+
+        private long totalBytesProcessed() {
+            return totalBytesProcessed;
+        }
+
+        private Set<String> temporaryTables() {
+            return temporaryTables;
+        }
+
+        private BigQuerySqlEngine.Result temporaryTableResult(String name) {
+            BigQuerySqlEngine.Result result = temporaryTableResults.get(name);
+            if (result == null) {
+                throw new IllegalStateException("Temporary table was not materialized: " + name);
+            }
+            return result;
+        }
+
+        private String prependTo(String sql) {
+            return setupObjects.isEmpty() ? sql : String.join(";\n", setupObjects.values()) + ";\n" + sql;
+        }
+    }
+
+    private static QueryOptions leafOptions(String sql, QueryOptions parent) {
+        return new QueryOptions(sql, parent.defaultDatasetId(), parent.queryParameters(), parent.parameterMode(),
+                parent.dryRun(), parent.useLegacySql());
     }
 
     private void executeStatement(String projectId, SqlDialectTranslator.Statement statement, QueryOptions options,
@@ -905,22 +1374,7 @@ public class BigQueryService {
                 BigQuerySqlEngine.DmlResult result = engine.executeDml(request(projectId, options.sql(), options,
                         false), tables(projectId, jobLocation));
                 replaceRows(projectId, target, result.tableRows());
-                job.setTotalBytesProcessed(String.valueOf(result.totalBytesProcessed()));
-                job.setNumDmlAffectedRows(String.valueOf(result.affectedRows()));
-                Map<String, String> stats = new LinkedHashMap<>();
-                if (statement.kind() == SqlDialectTranslator.StatementKind.INSERT
-                        || statement.kind() == SqlDialectTranslator.StatementKind.MERGE) {
-                    stats.put("insertedRowCount", String.valueOf(result.insertedRows()));
-                }
-                if (statement.kind() == SqlDialectTranslator.StatementKind.UPDATE
-                        || statement.kind() == SqlDialectTranslator.StatementKind.MERGE) {
-                    stats.put("updatedRowCount", String.valueOf(result.updatedRows()));
-                }
-                if (statement.kind() == SqlDialectTranslator.StatementKind.DELETE
-                        || statement.kind() == SqlDialectTranslator.StatementKind.MERGE) {
-                    stats.put("deletedRowCount", String.valueOf(result.deletedRows()));
-                }
-                job.setDmlStats(stats);
+                recordDmlStatistics(job, statement.kind(), result);
             }
             case TRUNCATE -> {
                 Table table = getTable(projectId, target.datasetId(), target.tableId());
@@ -982,6 +1436,31 @@ public class BigQueryService {
             }
             default -> throw QueryEngine.invalidQuery("Unsupported statement " + statement.statementType());
         }
+    }
+
+    private static void clearStatementStatistics(StoredJob job) {
+        job.setNumDmlAffectedRows(null);
+        job.setDmlStats(null);
+        job.setDdlOperationPerformed(null);
+        job.setDdlTargetTable(null);
+        job.setDdlTargetDataset(null);
+    }
+
+    private static void recordDmlStatistics(StoredJob job, SqlDialectTranslator.StatementKind kind,
+                                            BigQuerySqlEngine.DmlResult result) {
+        job.setTotalBytesProcessed(String.valueOf(result.totalBytesProcessed()));
+        job.setNumDmlAffectedRows(String.valueOf(result.affectedRows()));
+        Map<String, String> stats = new LinkedHashMap<>();
+        if (kind == SqlDialectTranslator.StatementKind.INSERT || kind == SqlDialectTranslator.StatementKind.MERGE) {
+            stats.put("insertedRowCount", String.valueOf(result.insertedRows()));
+        }
+        if (kind == SqlDialectTranslator.StatementKind.UPDATE || kind == SqlDialectTranslator.StatementKind.MERGE) {
+            stats.put("updatedRowCount", String.valueOf(result.updatedRows()));
+        }
+        if (kind == SqlDialectTranslator.StatementKind.DELETE || kind == SqlDialectTranslator.StatementKind.MERGE) {
+            stats.put("deletedRowCount", String.valueOf(result.deletedRows()));
+        }
+        job.setDmlStats(stats);
     }
 
     private void createFromStatement(String projectId, SqlDialectTranslator.Statement statement, QueryOptions options,
