@@ -17,6 +17,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -291,6 +293,13 @@ final class SqlDialectTranslator {
         CREATE_SCHEMA, DROP_SCHEMA
     }
 
+    enum PartitionExpression {
+        INGESTION_TIME, BARE_DATE, DATE, TIMESTAMP_TRUNC, DATETIME_TRUNC, DATE_TRUNC, RANGE_BUCKET
+    }
+
+    private record PartitionSpec(Map<String, Object> timeMetadata, Map<String, Object> rangeMetadata,
+                                 PartitionExpression expression) {}
+
     /**
      * A classified statement. {@code querySql} is the GoogleSQL text of the {@code SELECT} part
      * of {@code CREATE TABLE ... AS} and {@code CREATE VIEW}; {@code columns} is the column list
@@ -298,7 +307,9 @@ final class SqlDialectTranslator {
      */
     record Statement(StatementKind kind, String statementType, TableRef target, String datasetTarget,
                      boolean orReplace, boolean ifNotExists, boolean ifExists, boolean cascade,
-                     boolean materialized, String querySql, List<TableFieldSchema> columns) {
+                     boolean materialized, String querySql, List<TableFieldSchema> columns,
+                     Map<String, Object> timePartitioning, Map<String, Object> rangePartitioning,
+                     PartitionExpression partitionExpression) {
 
         boolean isDml() {
             return kind == StatementKind.INSERT || kind == StatementKind.UPDATE || kind == StatementKind.DELETE
@@ -658,14 +669,22 @@ final class SqlDialectTranslator {
         switch (object) {
             case "SCHEMA" -> {
                 return new Statement(StatementKind.CREATE_SCHEMA, "CREATE_SCHEMA", null, datasetOf(path.segments()),
-                        orReplace, ifNotExists, false, false, false, null, null);
+                        orReplace, ifNotExists, false, false, false, null, null, null, null, null);
             }
             case "TABLE" -> {
                 TableRef target = resolveTable(path.segments());
                 int asIndex = topLevelAsSelect(path.end());
                 if (asIndex >= 0) {
+                    PartitionSpec partitioning = createTablePartitioning(path.end(), asIndex);
+                    if (partitioning != null && partitioning.timeMetadata() != null
+                            && !partitioning.timeMetadata().containsKey("field")) {
+                        throw invalidQuery("CREATE TABLE AS SELECT does not support ingestion-time partitioning");
+                    }
                     return new Statement(StatementKind.CREATE_TABLE, "CREATE_TABLE_AS_SELECT", target, null,
-                            orReplace, ifNotExists, false, false, false, text(asIndex + 1, tokens.size()), null);
+                            orReplace, ifNotExists, false, false, false, text(asIndex + 1, tokens.size()), null,
+                            partitioning != null ? partitioning.timeMetadata() : null,
+                            partitioning != null ? partitioning.rangeMetadata() : null,
+                            partitioning != null ? partitioning.expression() : null);
                 }
                 int open = nextSignificant(path.end(), tokens.size());
                 if (open < 0 || !tokens.get(open).isPunct("(")) {
@@ -673,8 +692,12 @@ final class SqlDialectTranslator {
                             + " (LIKE and COPY are not supported by the floci BigQuery emulator)");
                 }
                 List<TableFieldSchema> columns = columnDefinitions(open, matchingParen(open));
+                PartitionSpec partitioning = createTablePartitioning(matchingParen(open) + 1, tokens.size());
                 return new Statement(StatementKind.CREATE_TABLE, "CREATE_TABLE", target, null, orReplace,
-                        ifNotExists, false, false, false, null, columns);
+                        ifNotExists, false, false, false, null, columns,
+                        partitioning != null ? partitioning.timeMetadata() : null,
+                        partitioning != null ? partitioning.rangeMetadata() : null,
+                        partitioning != null ? partitioning.expression() : null);
             }
             case "VIEW" -> {
                 TableRef target = resolveTable(path.segments());
@@ -684,7 +707,8 @@ final class SqlDialectTranslator {
                 }
                 return new Statement(StatementKind.CREATE_VIEW,
                         materialized ? "CREATE_MATERIALIZED_VIEW" : "CREATE_VIEW", target, null, orReplace,
-                        ifNotExists, false, false, materialized, text(asIndex + 1, tokens.size()).trim(), null);
+                        ifNotExists, false, false, materialized, text(asIndex + 1, tokens.size()).trim(), null, null,
+                        null, null);
             }
             default -> throw invalidQuery("CREATE " + object + " is not supported by the floci BigQuery emulator yet.");
         }
@@ -719,18 +743,111 @@ final class SqlDialectTranslator {
         }
         return switch (object) {
             case "SCHEMA" -> new Statement(StatementKind.DROP_SCHEMA, "DROP_SCHEMA", null, datasetOf(path.segments()),
-                    false, false, ifExists, cascade, false, null, null);
+                    false, false, ifExists, cascade, false, null, null, null, null, null);
             case "TABLE" -> new Statement(StatementKind.DROP_TABLE, "DROP_TABLE", resolveTable(path.segments()), null,
-                    false, false, ifExists, false, false, null, null);
+                    false, false, ifExists, false, false, null, null, null, null, null);
             case "VIEW" -> new Statement(StatementKind.DROP_VIEW,
                     materialized ? "DROP_MATERIALIZED_VIEW" : "DROP_VIEW", resolveTable(path.segments()), null,
-                    false, false, ifExists, false, materialized, null, null);
+                    false, false, ifExists, false, materialized, null, null, null, null, null);
             default -> throw invalidQuery("DROP " + object + " is not supported by the floci BigQuery emulator yet.");
         };
     }
 
     private Statement statement(StatementKind kind, String statementType, TableRef target) {
-        return new Statement(kind, statementType, target, null, false, false, false, false, false, null, null);
+        return new Statement(kind, statementType, target, null, false, false, false, false, false, null, null, null,
+                null, null);
+    }
+
+    /** Extracts BigQuery time or integer-range partitioning metadata from a CREATE TABLE suffix. */
+    private PartitionSpec createTablePartitioning(int from, int to) {
+        int depth = 0;
+        int partition = -1;
+        for (int i = from; i < to; i++) {
+            Token token = tokens.get(i);
+            if (token.isPunct("(")) {
+                depth++;
+            } else if (token.isPunct(")")) {
+                depth--;
+            } else if (depth == 0 && token.isKeyword("PARTITION")) {
+                int by = nextSignificant(i + 1, to);
+                if (by >= 0 && tokens.get(by).isKeyword("BY")) {
+                    partition = nextSignificant(by + 1, to);
+                    break;
+                }
+            }
+        }
+        if (partition < 0) {
+            return null;
+        }
+
+        depth = 0;
+        int end = to;
+        for (int i = partition; i < to; i++) {
+            Token token = tokens.get(i);
+            if (token.isPunct("(")) {
+                depth++;
+            } else if (token.isPunct(")")) {
+                depth--;
+            } else if (depth == 0 && (token.isKeyword("CLUSTER") || token.isKeyword("OPTIONS")
+                    || token.isKeyword("AS"))) {
+                end = i;
+                break;
+            }
+        }
+        String expression = text(partition, end).replaceAll("\\s+", "");
+        if (expression.equalsIgnoreCase("_PARTITIONDATE")
+                || expression.equalsIgnoreCase("DATE(_PARTITIONTIME)")) {
+            return new PartitionSpec(Map.of("type", "DAY"), null, PartitionExpression.INGESTION_TIME);
+        }
+
+        Matcher range = Pattern.compile(
+                "(?i)RANGE_BUCKET\\((`?[A-Za-z_][A-Za-z0-9_]*`?),"
+                        + "GENERATE_ARRAY\\((-?[0-9]+),(-?[0-9]+)(?:,(-?[0-9]+))?\\)\\)")
+                .matcher(expression);
+        if (range.matches()) {
+            String interval = range.group(4) != null ? range.group(4) : "1";
+            Map<String, Object> bounds = Map.of(
+                    "start", range.group(2), "end", range.group(3), "interval", interval);
+            return new PartitionSpec(null, Map.of(
+                    "field", unquoteIdentifier(range.group(1)), "range", bounds), PartitionExpression.RANGE_BUCKET);
+        }
+
+        Matcher truncated = Pattern.compile(
+                "(?i)(TIMESTAMP|DATETIME|DATE)_TRUNC\\((`?[A-Za-z_][A-Za-z0-9_]*`?),(HOUR|DAY|MONTH|YEAR)\\)")
+                .matcher(expression);
+        if (truncated.matches()) {
+            String function = truncated.group(1).toUpperCase(Locale.ROOT);
+            String field = unquoteIdentifier(truncated.group(2));
+            String type = truncated.group(3).toUpperCase(Locale.ROOT);
+            PartitionExpression expressionKind = PartitionExpression.valueOf(function + "_TRUNC");
+            if (expressionKind == PartitionExpression.DATE_TRUNC
+                    && ("HOUR".equals(type) || "DAY".equals(type))) {
+                throw invalidQuery("DATE_TRUNC partitioning supports MONTH or YEAR granularity");
+            }
+            if (field.equalsIgnoreCase(BigQueryService.PARTITION_TIME)) {
+                if (expressionKind != PartitionExpression.TIMESTAMP_TRUNC) {
+                    throw invalidQuery("_PARTITIONTIME must use TIMESTAMP_TRUNC");
+                }
+                return new PartitionSpec(Map.of("type", type), null, PartitionExpression.INGESTION_TIME);
+            }
+            return new PartitionSpec(Map.of("type", type, "field", field), null, expressionKind);
+        }
+        Matcher date = Pattern.compile("(?i)DATE\\((`?[A-Za-z_][A-Za-z0-9_]*`?)\\)")
+                .matcher(expression);
+        if (date.matches()) {
+            return new PartitionSpec(Map.of("type", "DAY", "field", unquoteIdentifier(date.group(1))), null,
+                    PartitionExpression.DATE);
+        }
+        if (expression.matches("`?[A-Za-z_][A-Za-z0-9_]*`?")) {
+            return new PartitionSpec(Map.of("type", "DAY", "field", unquoteIdentifier(expression)), null,
+                    PartitionExpression.BARE_DATE);
+        }
+        throw invalidQuery("Unsupported PARTITION BY expression in CREATE TABLE: " + expression);
+    }
+
+    private static String unquoteIdentifier(String identifier) {
+        return identifier.startsWith("`") && identifier.endsWith("`")
+                ? identifier.substring(1, identifier.length() - 1).replace("``", "`") : identifier;
     }
 
     private String datasetOf(List<String> segments) {
@@ -1779,7 +1896,7 @@ final class SqlDialectTranslator {
         expandHavingStructAliasFields();
         rewritePivotSyntax();
         nameAnonymousColumns();
-        String replacementStarExclusion = soleReplacementStarExclusion();
+        String replacementStarExclusion = replacementStarExclusion();
         String rendered = render(0, tokens.size()).trim();
         if (replacementStarExclusion != null) {
             rendered = "SELECT *" + replacementStarExclusion + " FROM (" + rendered
@@ -2830,23 +2947,24 @@ final class SqlDialectTranslator {
     }
 
     /** DuckDB requires its pattern-filtered star and REPLACE modifiers to live in separate SELECTs. */
-    private String soleReplacementStarExclusion() {
+    private String replacementStarExclusion() {
         int select = firstTopLevelSelect();
         if (select < 0) {
             return null;
         }
         List<int[]> items = selectItems(select);
-        if (items == null || items.size() != 1) {
+        if (items == null) {
             return null;
         }
-        int[] item = items.getFirst();
-        for (int i = item[0]; i < item[1]; i++) {
-            if (!tokens.get(i).isPunct("*")) {
-                continue;
-            }
-            int next = nextSignificant(i + 1, item[1]);
-            if (next >= 0 && tokens.get(next).isKeyword("REPLACE")) {
-                return projectionStarExclusion(i);
+        for (int[] item : items) {
+            for (int i = item[0]; i < item[1]; i++) {
+                if (!tokens.get(i).isPunct("*")) {
+                    continue;
+                }
+                int next = nextSignificant(i + 1, item[1]);
+                if (next >= 0 && tokens.get(next).isKeyword("REPLACE")) {
+                    return projectionStarExclusion(i);
+                }
             }
         }
         return null;
@@ -3348,6 +3466,8 @@ final class SqlDialectTranslator {
     private String starExclusionList(int star, int open, int close) {
         ProjectionSource source = projectionSourceForStar(star);
         List<String> names = projectionStarHiddenColumns(star).stream()
+                .filter(name -> !name.equals(BigQueryService.PARTITION_DATE)
+                        && !name.equals(BigQueryService.PARTITION_TIME))
                 .filter(name -> !name.equals("_TABLE_SUFFIX") || source != null && source.wildcardTable())
                 .map(DuckTypes::quoteIdentifier).collect(Collectors.toCollection(ArrayList::new));
         for (Token token : significant(open + 1, close)) {
@@ -3376,6 +3496,8 @@ final class SqlDialectTranslator {
         List<ProjectionSource> sources = projectionSourcesForStar(star);
         List<String> names = new ArrayList<>();
         if (!sources.isEmpty() && sources.getFirst().directTable()) {
+            names.add(BigQueryService.PARTITION_DATE);
+            names.add(BigQueryService.PARTITION_TIME);
             names.add("_TABLE_SUFFIX");
         }
         names.addAll(offsetStarHiddenColumns(star));
@@ -4030,7 +4152,7 @@ final class SqlDialectTranslator {
         if (!InformationSchema.isView(view)) {
             throw invalidQuery("INFORMATION_SCHEMA." + view + " is not supported by the floci BigQuery emulator"
                     + " (view names are case-sensitive); supported views: SCHEMATA, TABLES, COLUMNS,"
-                    + " COLUMN_FIELD_PATHS, TABLE_OPTIONS, VIEWS.");
+                    + " COLUMN_FIELD_PATHS, TABLE_OPTIONS, VIEWS, PARTITIONS.");
         }
         List<String> qualifiers = segments.subList(0, marker);
         if (qualifiers.size() > 2) {
@@ -4042,6 +4164,10 @@ final class SqlDialectTranslator {
         }
         String scope = qualifiers.isEmpty() ? null : qualifiers.getLast();
         if (scope != null && scope.toLowerCase(Locale.ROOT).startsWith("region-")) {
+            if (InformationSchema.datasetOnly(view)) {
+                throw invalidQuery("INFORMATION_SCHEMA." + view
+                        + " needs a dataset qualifier; region qualifiers are not supported");
+            }
             return new InformationSchema.Ref(view, null, scope.substring("region-".length()));
         }
         if (InformationSchema.regionOnly(view)) {

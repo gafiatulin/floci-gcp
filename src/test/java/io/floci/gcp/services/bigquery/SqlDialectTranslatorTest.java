@@ -70,7 +70,8 @@ class SqlDialectTranslatorTest {
     void bareTableUsesDefaultDataset() {
         SqlDialectTranslator.Translation t = SqlDialectTranslator.translate("SELECT * FROM users",
                 "test-project", "ds", SqlDialectTranslator.QueryParameters.none());
-        assertEquals("SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$' FROM \"ds\".\"users\"", t.sql());
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$' FROM \"ds\".\"users\"",
+                t.sql());
     }
 
     @Test
@@ -148,7 +149,7 @@ class SqlDialectTranslatorTest {
         assertEquals("SELECT {'id': id, 'display_name': name} FROM \"ds\".\"users\"",
                 sql("SELECT AS STRUCT id, name AS display_name FROM ds.users"));
         assertEquals("SELECT struct_pack(*COLUMNS(input.* NOT SIMILAR TO"
-                        + " '(?i)^(_TABLE_SUFFIX|id)$'))"
+                        + " '(?i)^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX|id)$'))"
                         + " FROM \"ds\".\"users\" AS \"input\"",
                 sql("SELECT AS STRUCT input.* EXCEPT(id) FROM ds.users AS input"));
         assertEquals("SELECT {'_field_1': index * 25} AS value",
@@ -324,11 +325,11 @@ class SqlDialectTranslatorTest {
     void qualifiedStarsHidePseudocolumnsOnlyForTheirOwnPhysicalSource() {
         String derivedFirst = sql("SELECT d.*, w.* FROM (SELECT 1 AS id, 'd' AS _TABLE_SUFFIX) d"
                 + " JOIN `ds.events_*` w ON d.id = w.id");
-        assertTrue(derivedFirst.startsWith("SELECT d.*, w.* NOT SIMILAR TO '^(_TABLE_SUFFIX)$'"), derivedFirst);
+        assertTrue(derivedFirst.startsWith("SELECT d.*, w.* NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$'"), derivedFirst);
 
         String physicalFirst = sql("SELECT w.*, d.* FROM `ds.events_*` w"
                 + " JOIN (SELECT 1 AS id, 'd' AS _TABLE_SUFFIX) d ON d.id = w.id");
-        assertTrue(physicalFirst.startsWith("SELECT w.* NOT SIMILAR TO '^(_TABLE_SUFFIX)$', d.*"), physicalFirst);
+        assertTrue(physicalFirst.startsWith("SELECT w.* NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$', d.*"), physicalFirst);
         assertEquals(1, physicalFirst.split("NOT SIMILAR", -1).length - 1, physicalFirst);
     }
 
@@ -349,7 +350,7 @@ class SqlDialectTranslatorTest {
     void ctesOfParenthesizedQueriesAndSubqueriesAreNotTreatedAsTables() {
         SqlDialectTranslator.Translation t = translate("(WITH s AS (SELECT * FROM ds.t) SELECT x + 1 FROM s)");
         assertEquals(Set.of(new SqlDialectTranslator.TableRef("ds", "t")), t.tables());
-        assertEquals("(WITH s AS (SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$'"
+        assertEquals("(WITH s AS (SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$'"
                 + " FROM \"ds\".\"t\") SELECT x + 1 AS f0_ FROM \"s\")", t.sql());
         assertEquals("SELECT *"
                         + " FROM (WITH s AS (SELECT 1 AS x) SELECT x FROM \"s\") AS \"_floci_derived_0\"",
@@ -507,19 +508,23 @@ class SqlDialectTranslatorTest {
 
     @Test
     void starAndImplicitAliasesKeepTheirNames() {
-        assertEquals("SELECT * NOT SIMILAR TO '(?i)^(_TABLE_SUFFIX|secret)$',"
+        assertEquals("SELECT * NOT SIMILAR TO '(?i)^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX|secret)$',"
                         + " UPPER(name) AS \"upper_name\" FROM \"ds\".\"t\"",
                 sql("SELECT * EXCEPT (secret), UPPER(name) upper_name FROM ds.t"));
-        assertEquals("SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$' FROM ("
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$' FROM ("
                         + "SELECT * REPLACE (UPPER(name) AS name) FROM \"ds\".\"t\""
                         + ") AS \"_floci_star_replace\"",
                 sql("SELECT * REPLACE (UPPER(name) AS name) FROM ds.t"));
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$' FROM ("
+                        + "SELECT * REPLACE (UPPER(name) AS name), id AS original_id FROM \"ds\".\"t\""
+                        + ") AS \"_floci_star_replace\"",
+                sql("SELECT * REPLACE (UPPER(name) AS name), id AS original_id FROM ds.t"));
     }
 
     @Test
     void parenthesizedPathKeepsItsImplicitColumnName() {
         assertEquals("WITH categories AS (SELECT DISTINCT(category) FROM \"ds\".\"t\")"
-                        + " SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$'"
+                        + " SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$'"
                         + " FROM \"ds\".\"t\" JOIN \"categories\" USING (category)",
                 sql("WITH categories AS (SELECT DISTINCT(category) FROM ds.t)"
                         + " SELECT * FROM ds.t JOIN categories USING (category)"));
@@ -1161,7 +1166,7 @@ class SqlDialectTranslatorTest {
         String out = SqlDialectTranslator.translate(
                 "SELECT * FROM ds.t WHERE name = @name AND age >= @min_age AND ts > @since",
                 "test-project", null, new SqlDialectTranslator.QueryParameters(params, "NAMED")).sql();
-        assertEquals("SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$' FROM \"ds\".\"t\""
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$' FROM \"ds\".\"t\""
                 + " WHERE name = CAST('O''Brien' AS VARCHAR)"
                 + " AND age >= CAST(21 AS BIGINT) AND ts > CAST('2024-01-02 03:04:05+00:00' AS TIMESTAMPTZ)", out);
     }
@@ -1173,7 +1178,7 @@ class SqlDialectTranslatorTest {
                 "parameterValue", Map.of("arrayValues", List.of(Map.of("value", "1"), Map.of("value", "2")))));
         String out = SqlDialectTranslator.translate("SELECT * FROM ds.t WHERE id IN UNNEST(?)",
                 "test-project", null, new SqlDialectTranslator.QueryParameters(params, "POSITIONAL")).sql();
-        assertEquals("SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$' FROM \"ds\".\"t\""
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$' FROM \"ds\".\"t\""
                 + " WHERE id IN (SELECT UNNEST([CAST(1 AS BIGINT), CAST(2 AS BIGINT)]))", out);
     }
 
@@ -1201,7 +1206,7 @@ class SqlDialectTranslatorTest {
         String out = SqlDialectTranslator.translate("SELECT * FROM ds.t WHERE active = @flag",
                 "test-project", null, new SqlDialectTranslator.QueryParameters(
                         List.of(param("flag", "BOOL", "TRUE")), "NAMED")).sql();
-        assertEquals("SELECT * NOT SIMILAR TO '^(_TABLE_SUFFIX)$'"
+        assertEquals("SELECT * NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$'"
                 + " FROM \"ds\".\"t\" WHERE active = TRUE", out);
 
         // "yes" is not a BOOL literal. Coercing it to FALSE would silently invert the predicate,
@@ -1545,7 +1550,8 @@ class SqlDialectTranslatorTest {
     void createTableColumnsBecomeABigQuerySchema() {
         SqlDialectTranslator.Statement create = statement("CREATE TABLE IF NOT EXISTS ds.t ("
                 + "id INT64 NOT NULL OPTIONS(description = 'key'), amount BIGNUMERIC(40, 2), tags ARRAY<STRING>, "
-                + "place STRUCT<city STRING, geo STRUCT<lat FLOAT64, lng FLOAT64>>, PRIMARY KEY (id) NOT ENFORCED)");
+                + "place STRUCT<city STRING, geo STRUCT<lat FLOAT64, lng FLOAT64>>, PRIMARY KEY (id) NOT ENFORCED)"
+                + " PARTITION BY DATE(_PARTITIONTIME) OPTIONS(description = 'orders')");
         assertEquals("CREATE_TABLE", create.statementType());
         assertTrue(create.ifNotExists());
         List<io.floci.gcp.services.bigquery.model.TableFieldSchema> cols = create.columns();
@@ -1558,6 +1564,23 @@ class SqlDialectTranslatorTest {
         assertEquals("RECORD", cols.get(3).getType());
         assertEquals("RECORD", cols.get(3).getFields().get(1).getType());
         assertEquals("FLOAT", cols.get(3).getFields().get(1).getFields().get(0).getType());
+        assertEquals(Map.of("type", "DAY"), create.timePartitioning());
+
+        SqlDialectTranslator.Statement fieldPartitioned = statement(
+                "CREATE TABLE ds.events (event_time TIMESTAMP) PARTITION BY TIMESTAMP_TRUNC(event_time, HOUR)");
+        assertEquals(Map.of("type", "HOUR", "field", "event_time"), fieldPartitioned.timePartitioning());
+
+        SqlDialectTranslator.Statement rangePartitioned = statement(
+                "CREATE TABLE ds.ranged (id INT64) PARTITION BY RANGE_BUCKET(id, GENERATE_ARRAY(-10, 100, 5))");
+        assertEquals(Map.of("field", "id", "range",
+                Map.of("start", "-10", "end", "100", "interval", "5")), rangePartitioned.rangePartitioning());
+
+        for (String type : List.of("HOUR", "DAY", "MONTH", "YEAR")) {
+            SqlDialectTranslator.Statement ingestionTime = statement(
+                    "CREATE TABLE ds.ingestion (id INT64) PARTITION BY TIMESTAMP_TRUNC(_PARTITIONTIME, "
+                            + type + ")");
+            assertEquals(Map.of("type", type), ingestionTime.timePartitioning());
+        }
     }
 
     @Test
@@ -1566,6 +1589,22 @@ class SqlDialectTranslatorTest {
         assertEquals("CREATE_TABLE_AS_SELECT", ctas.statementType());
         assertTrue(ctas.orReplace());
         assertEquals("SELECT a FROM ds.src", ctas.querySql().trim());
+
+        SqlDialectTranslator.Statement partitionedCtas = statement(
+                "CREATE TABLE ds.daily PARTITION BY DATE(event_time) AS SELECT event_time FROM ds.src");
+        assertEquals(Map.of("type", "DAY", "field", "event_time"), partitionedCtas.timePartitioning());
+        assertEquals("SELECT event_time FROM ds.src", partitionedCtas.querySql().trim());
+
+        SqlDialectTranslator.Statement rangeCtas = statement(
+                "CREATE TABLE ds.ranged PARTITION BY RANGE_BUCKET(id, GENERATE_ARRAY(0, 100)) "
+                        + "AS SELECT id FROM ds.src");
+        assertEquals(Map.of("field", "id", "range",
+                Map.of("start", "0", "end", "100", "interval", "1")), rangeCtas.rangePartitioning());
+
+        GcpException ingestionCtas = assertThrows(GcpException.class, () -> statement(
+                "CREATE TABLE ds.daily PARTITION BY DATE(_PARTITIONTIME) AS SELECT event_time FROM ds.src"));
+        assertEquals("invalidQuery", ingestionCtas.getReason());
+        assertTrue(ingestionCtas.getMessage().contains("ingestion-time"));
 
         SqlDialectTranslator.Statement view = statement("CREATE VIEW ds.v OPTIONS(description='x') AS SELECT 1 AS a");
         assertEquals("CREATE_VIEW", view.statementType());
@@ -1613,6 +1652,8 @@ class SqlDialectTranslatorTest {
                 translate("SELECT * FROM `test-project.ds.INFORMATION_SCHEMA.COLUMNS` c").informationSchema());
         assertEquals(Set.of(new InformationSchema.Ref("TABLES", null, "us")),
                 translate("SELECT * FROM `region-us`.INFORMATION_SCHEMA.TABLES").informationSchema());
+        assertEquals(Set.of(new InformationSchema.Ref("PARTITIONS", "ds", null)),
+                translate("SELECT * FROM ds.INFORMATION_SCHEMA.PARTITIONS").informationSchema());
         assertEquals(Set.of(new InformationSchema.Ref("SCHEMATA", null, "us-central1")),
                 translate("SELECT * FROM region-us-central1.INFORMATION_SCHEMA.SCHEMATA").informationSchema());
         assertEquals(Set.of(new InformationSchema.Ref("SCHEMATA", null, "us")),
@@ -1629,6 +1670,8 @@ class SqlDialectTranslatorTest {
                         SqlDialectTranslator.QueryParameters.none()).informationSchema());
         assertTrue(invalid("SELECT * FROM INFORMATION_SCHEMA.TABLES").getMessage().contains("qualifier"));
         assertTrue(invalid("SELECT * FROM ds.INFORMATION_SCHEMA.tables").getMessage().contains("case-sensitive"));
+        assertTrue(invalid("SELECT * FROM `region-us`.INFORMATION_SCHEMA.PARTITIONS")
+                .getMessage().contains("dataset qualifier"));
         invalid("SELECT * FROM ds.INFORMATION_SCHEMA.JOBS");
         invalid("SELECT * FROM ds.INFORMATION_SCHEMA.SCHEMATA");
     }

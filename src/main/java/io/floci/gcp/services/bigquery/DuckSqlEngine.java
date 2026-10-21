@@ -176,7 +176,6 @@ public class DuckSqlEngine implements BigQuerySqlEngine {
                 request.projectId(), request.defaultDatasetId(),
                 new SqlDialectTranslator.QueryParameters(request.queryParameters(), request.parameterMode()),
                 ref -> columnNames(tables, ref));
-
         String flociEndpoint = flociEndpoint();
         Staging staging = stage(request.projectId(), translation.tables(), translation.informationSchema(),
                 tables, flociEndpoint);
@@ -186,8 +185,9 @@ public class DuckSqlEngine implements BigQuerySqlEngine {
             run("EXPLAIN " + translation.sql(), staging.emptySetup(), flociEndpoint, null);
             return new DmlResult(0, 0, 0, 0, List.of(), staging.bytesProcessed());
         }
-        String followup = "SELECT * FROM " + DuckTypes.quoteIdentifier(target.datasetId()) + "."
+        String stagedTarget = DuckTypes.quoteIdentifier(target.datasetId()) + "."
                 + DuckTypes.quoteIdentifier(target.tableId());
+        String followup = "SELECT * FROM " + stagedTarget;
         DuckClient.DuckResult result = run(translation.sql(), staging.setup(), flociEndpoint, followup);
         if (result.followup() == null || result.followup().columns() == null) {
             throw GcpException.failedPrecondition("DML needs a floci-duck image that supports follow-up"
@@ -852,8 +852,22 @@ public class DuckSqlEngine implements BigQuerySqlEngine {
     }
 
     private static List<TableFieldSchema> stagingFields(Table table) {
-        return table.getSchema() != null && table.getSchema().getFields() != null
-                ? table.getSchema().getFields() : List.of();
+        List<TableFieldSchema> fields = new ArrayList<>(table.getSchema() != null && table.getSchema().getFields() != null
+                ? table.getSchema().getFields() : List.of());
+        if (BigQueryService.isIngestionTimePartitioned(table)) {
+            if (BigQueryService.hasPartitionDatePseudocolumn(table)) {
+                fields.add(field(BigQueryService.PARTITION_DATE, "DATE"));
+            }
+            fields.add(field(BigQueryService.PARTITION_TIME, "TIMESTAMP"));
+        }
+        return fields;
+    }
+
+    private static TableFieldSchema field(String name, String type) {
+        TableFieldSchema field = new TableFieldSchema();
+        field.setName(name);
+        field.setType(type);
+        return field;
     }
 
     /** {@code CREATE TABLE target} from NDJSON rows at {@code url}, or empty with the given columns. */
