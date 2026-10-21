@@ -181,7 +181,8 @@ Queries are translated to DuckDB SQL and executed on the sidecar, so most of Goo
 - Functions rewritten to their DuckDB equivalents: `SAFE_DIVIDE`, `IEEE_DIVIDE`, `DIV`, `IF`,
   `COUNTIF`, `CONCAT`, `LOGICAL_AND`/`LOGICAL_OR`, `ARRAY_LENGTH`, `ARRAY_REVERSE`, `ARRAY_CONCAT_AGG`,
   `GENERATE_ARRAY`, `GENERATE_UUID`, `APPROX_COUNT_DISTINCT`, `APPROX_QUANTILES`,
-  `SPLIT`, `FORMAT`, `TO_HEX`, `MD5`, `SHA1`, `SHA256`, `TO_JSON_STRING`,
+  `SPLIT`, `FORMAT`, `LENGTH`, `BYTE_LENGTH`, `FARM_FINGERPRINT`, `TO_HEX`, `MD5`, `SHA1`,
+  `SHA256`, `TO_JSON_STRING`,
   `JSON_VALUE`/`JSON_EXTRACT_SCALAR`,
   `JSON_QUERY`/`JSON_EXTRACT`, `REGEXP_CONTAINS`, `REGEXP_EXTRACT`, `REGEXP_REPLACE`,
   `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_DATETIME`, `UNIX_SECONDS`/`UNIX_MILLIS`/`UNIX_MICROS`/`UNIX_DATE`,
@@ -196,6 +197,21 @@ Queries are translated to DuckDB SQL and executed on the sidecar, so most of Goo
 - `CONTAINS_SUBSTR` supports scalar `STRING` inputs with case-insensitive NFC-normalized substring
   matching. Recursive `STRUCT`/`ARRAY` search and the optional JSON scope argument are not
   emulated.
+- `HLL_COUNT.INIT`, `HLL_COUNT.EXTRACT`, `HLL_COUNT.MERGE` and `HLL_COUNT.MERGE_PARTIAL`
+  compose through BigQuery-compatible HLL++ ZetaSketch `BYTES`. Initialization supports `INT64`,
+  `STRING` and `BYTES`, including BigQuery's precision range and null behavior. `NUMERIC` and
+  `BIGNUMERIC` initialization are not supported.
+- `LENGTH` counts Unicode characters for `STRING` and bytes for `BYTES`. `BYTE_LENGTH` returns
+  the UTF-8 byte length of `STRING` and the byte length of `BYTES`.
+- `FARM_FINGERPRINT` accepts `STRING` and `BYTES` and returns the BigQuery-compatible signed
+  `INT64` FarmHash Fingerprint64 value.
+- `TO_JSON_STRING` preserves typed values recursively. Temporal values use BigQuery's canonical
+  forms, UUID and `HUGEINT` values serialize as strings, and ordinary `STRING` values are not
+  reinterpreted based on their contents. The optional `pretty_print` argument is supported.
+- `NET.IP_FROM_STRING` and `NET.SAFE_IP_FROM_STRING` parse IPv4 and IPv6 into `BYTES`.
+  `NET.IP_TRUNC` applies a prefix length and `NET.IP_TO_STRING` formats the bytes canonically.
+- `BYTES` expressions support byte-oriented `BIT_COUNT`, `REPEAT`, `CONCAT`, left shift and
+  bitwise AND, including inside temporary SQL functions.
 - `RAND` returns a uniformly distributed value in the half-open interval `[0, 1)`.
 - `ARRAY_AGG(value IGNORE NULLS ORDER BY ... LIMIT n)` preserves BigQuery's null filtering,
   aggregate ordering, and inline result limit. As in BigQuery, these aggregate modifiers are rejected
@@ -525,7 +541,7 @@ literal   := 'string' | "string" | integer | float | TRUE | FALSE
   `FOR SYSTEM_TIME AS OF`, `GEOGRAPHY` functions, BigQuery ML, and remote functions are not
   emulated.
 - Most `SAFE.`-prefixed functions are not emulated. `SAFE_CAST`, `SAFE.FROM_HEX`, `SAFE.PARSE_DATE`,
-  and `SAFE.PARSE_TIMESTAMP` are supported explicitly.
+  `SAFE.PARSE_TIMESTAMP`, and `NET.SAFE_IP_FROM_STRING` are supported explicitly.
 - `NUMERIC` and `BIGNUMERIC` are computed as `DECIMAL(38, 9)`.
 - `TIMESTAMP` values are staged as ISO-8601 strings for DuckDB, including values nested inside
   `RECORD` or `REPEATED` columns; the BigQuery wire format continues to use epoch seconds.

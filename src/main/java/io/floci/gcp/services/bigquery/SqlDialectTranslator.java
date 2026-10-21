@@ -91,7 +91,8 @@ final class SqlDialectTranslator {
     private static final Set<String> SHIMMED_FUNCTIONS = Set.of(
             "CAST", "SAFE_CAST", "EXTRACT", "STRUCT", "SAFE_DIVIDE", "IEEE_DIVIDE", "DIV", "IF", "COUNTIF", "CONCAT",
             "LOGICAL_AND", "LOGICAL_OR", "ARRAY_LENGTH", "ARRAY_REVERSE", "ARRAY_AGG", "ARRAY_CONCAT_AGG", "CONTAINS_SUBSTR",
-            "APPROX_COUNT_DISTINCT", "TO_HEX", "MD5", "SHA1", "SHA256", "RAND",
+            "FARM_FINGERPRINT", "APPROX_COUNT_DISTINCT", "BYTE_LENGTH", "TO_HEX", "MD5", "SHA1", "SHA256",
+            "LENGTH", "RAND",
             "GENERATE_ARRAY", "SPLIT", "FORMAT", "APPROX_QUANTILES",
             "TO_JSON_STRING", "JSON_VALUE", "JSON_EXTRACT_SCALAR", "JSON_QUERY", "JSON_EXTRACT", "JSON_TYPE",
             "REGEXP_CONTAINS", "REGEXP_EXTRACT", "REGEXP_REPLACE", "CURRENT_TIMESTAMP", "CURRENT_DATE",
@@ -4180,6 +4181,34 @@ final class SqlDialectTranslator {
                     }
                 }
             }
+            if (upper.equals("NET") && next >= 0 && tokens.get(next).isPunct(".")) {
+                int function = nextSignificant(next + 1, end);
+                int open = function < 0 ? -1 : nextSignificant(function + 1, end);
+                if (function >= 0 && open >= 0 && tokens.get(open).isPunct("(")) {
+                    int close = matchingParen(open);
+                    String call = renderNet(tokens.get(function).upper(), open, close);
+                    if (call != null) {
+                        out.append(call);
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+            if (upper.equals("HLL_COUNT") && !isPrecededByDot(i)) {
+                int dot = next;
+                int function = dot < 0 ? -1 : nextSignificant(dot + 1, end);
+                int open = function < 0 ? -1 : nextSignificant(function + 1, end);
+                if (dot >= 0 && tokens.get(dot).isPunct(".") && function >= 0
+                        && tokens.get(function).kind == Kind.IDENT && open >= 0 && tokens.get(open).isPunct("(")) {
+                    int close = matchingParen(open);
+                    String call = renderHllCount(tokens.get(function).upper(), open, close);
+                    if (call != null) {
+                        out.append(call);
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
             if (upper.equals("IN") && next >= 0 && tokens.get(next).isKeyword("UNNEST")) {
                 // x IN UNNEST(array): DuckDB only accepts UNNEST in a select list.
                 int open = nextSignificant(next + 1, end);
@@ -5337,6 +5366,10 @@ final class SqlDialectTranslator {
             case "APPROX_QUANTILES" -> renderApproxQuantiles(a, name);
             case "CONTAINS_SUBSTR" -> args(a, 2, name, "contains(lower(nfc_normalize(CAST(" + at(a, 0)
                     + " AS VARCHAR))), lower(nfc_normalize(CAST(" + at(a, 1) + " AS VARCHAR))))");
+            case "BYTE_LENGTH" -> {
+                exactArgs(a, 1, name);
+                yield "floci_byte_length(" + at(a, 0) + ")";
+            }
             // BigQuery emits lowercase hexadecimal text; DuckDB's hex/to_hex emits uppercase.
             case "TO_HEX" -> args(a, 1, name, "lower(hex(" + at(a, 0) + "))");
             // BigQuery's cryptographic hash functions return raw BYTES. DuckDB returns the
@@ -5344,12 +5377,20 @@ final class SqlDialectTranslator {
             case "MD5" -> args(a, 1, name, "from_hex(md5(" + at(a, 0) + "))");
             case "SHA1" -> args(a, 1, name, "from_hex(sha1(" + at(a, 0) + "))");
             case "SHA256" -> args(a, 1, name, "from_hex(sha256(" + at(a, 0) + "))");
+            case "LENGTH" -> {
+                exactArgs(a, 1, name);
+                yield "floci_length(" + at(a, 0) + ")";
+            }
             case "RAND" -> args(a, 0, name, "random()");
+            case "FARM_FINGERPRINT" -> {
+                exactArgs(a, 1, name);
+                yield "farm_fingerprint(" + at(a, 0) + ")";
+            }
             case "GENERATE_ARRAY" -> "generate_series(" + String.join(", ", a) + ")";
             case "SPLIT" -> a.size() == 1 ? "string_split(" + a.getFirst() + ", ',')"
                     : "string_split(" + String.join(", ", a) + ")";
             case "FORMAT" -> "printf(" + String.join(", ", a) + ")";
-            case "TO_JSON_STRING" -> "CAST(to_json(" + at(a, 0) + ") AS VARCHAR)";
+            case "TO_JSON_STRING" -> renderToJsonString(a, name);
             case "JSON_VALUE", "JSON_EXTRACT_SCALAR" -> a.size() == 1
                     ? "json_extract_string(" + a.getFirst() + ", '$')"
                     : "json_extract_string(" + String.join(", ", a) + ")";
@@ -5512,6 +5553,16 @@ final class SqlDialectTranslator {
                 + ") END), 1)";
     }
 
+    private static String renderToJsonString(List<String> arguments, String name) {
+        rangedArgs(arguments, 1, 2, name);
+        String rendered = "floci_to_json_string(" + String.join(", ", arguments) + ")";
+        if (arguments.size() == 1) {
+            return "coalesce(" + rendered + ", 'null')";
+        }
+        return "coalesce(" + rendered + ", CASE WHEN " + at(arguments, 1)
+                + " IS NULL THEN NULL ELSE 'null' END)";
+    }
+
     private static String renderApproxQuantiles(List<String> arguments, String name) {
         if (arguments.size() != 2) {
             return args(arguments, 2, name, "");
@@ -5535,6 +5586,34 @@ final class SqlDialectTranslator {
         }
         return "quantile_disc(" + at(arguments, 0) + ", list_transform(generate_series(0, CAST(" + quantileCount
                 + " AS BIGINT)), x -> CAST(x AS DOUBLE) / CAST(" + quantileCount + " AS DOUBLE)))";
+    }
+
+    /** DuckDB has no HLL++ functions, so the sidecar supplies BigQuery-compatible ZetaSketch UDFs. */
+    private String renderHllCount(String function, int open, int close) {
+        List<String> arguments = arguments(open, close);
+        return switch (function) {
+            case "INIT" -> {
+                hllArgs(arguments, 1, 2, function);
+                yield "floci_hll_init(list_filter(list(" + at(arguments, 0)
+                        + "), value -> value IS NOT NULL), CAST("
+                        + (arguments.size() == 2 ? at(arguments, 1) : "15") + " AS INTEGER))";
+            }
+            case "EXTRACT" -> {
+                hllArgs(arguments, 1, 1, function);
+                yield "floci_hll_extract(CAST(" + at(arguments, 0) + " AS BLOB))";
+            }
+            case "MERGE" -> {
+                hllArgs(arguments, 1, 1, function);
+                yield "floci_hll_merge(list_filter(list(CAST(" + at(arguments, 0)
+                        + " AS BLOB)), sketch -> sketch IS NOT NULL))";
+            }
+            case "MERGE_PARTIAL" -> {
+                hllArgs(arguments, 1, 1, function);
+                yield "floci_hll_merge_partial(list_filter(list(CAST(" + at(arguments, 0)
+                        + " AS BLOB)), sketch -> sketch IS NOT NULL))";
+            }
+            default -> null;
+        };
     }
 
     private String renderSafeCall(String function, int open, int close) {
@@ -5570,6 +5649,36 @@ final class SqlDialectTranslator {
                 + zone + ", CAST(_floci_parsed_timestamp AS TIMESTAMP)) END), 1)";
     }
 
+    private String renderNet(String function, int open, int close) {
+        List<String> arguments = arguments(open, close);
+        return switch (function) {
+            case "SAFE_IP_FROM_STRING" -> {
+                exactArgs(arguments, 1, "NET.SAFE_IP_FROM_STRING");
+                yield "safe_ip_from_string(" + at(arguments, 0) + ")";
+            }
+            case "IP_FROM_STRING" -> {
+                exactArgs(arguments, 1, "NET.IP_FROM_STRING");
+                yield "ip_from_string(" + at(arguments, 0) + ")";
+            }
+            case "IP_TO_STRING" -> {
+                exactArgs(arguments, 1, "NET.IP_TO_STRING");
+                yield "ip_to_string(" + at(arguments, 0) + ")";
+            }
+            case "IP_TRUNC" -> {
+                exactArgs(arguments, 2, "NET.IP_TRUNC");
+                yield "ip_trunc(" + at(arguments, 0) + ", " + at(arguments, 1) + ")";
+            }
+            default -> null;
+        };
+    }
+
+    private static void hllArgs(List<String> arguments, int minimum, int maximum, String function) {
+        if (arguments.size() < minimum || arguments.size() > maximum) {
+            throw invalidQuery("No matching signature for function HLL_COUNT." + function + " with "
+                    + arguments.size() + " arguments");
+        }
+    }
+
     private static String args(List<String> a, int expected, String name, String rendered) {
         if (a.size() < expected) {
             throw invalidQuery("No matching signature for function " + name + " with " + a.size() + " arguments");
@@ -5583,6 +5692,17 @@ final class SqlDialectTranslator {
                     + " arguments");
         }
         return rendered;
+    }
+
+    private static void exactArgs(List<String> arguments, int expected, String name) {
+        rangedArgs(arguments, expected, expected, name);
+    }
+
+    private static void rangedArgs(List<String> arguments, int minimum, int maximum, String name) {
+        if (arguments.size() < minimum || arguments.size() > maximum) {
+            throw invalidQuery("No matching signature for function " + name + " with "
+                    + arguments.size() + " arguments");
+        }
     }
 
     private static String at(List<String> a, int index) {
