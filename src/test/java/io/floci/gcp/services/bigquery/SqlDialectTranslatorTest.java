@@ -884,14 +884,28 @@ class SqlDialectTranslatorTest {
         assertEquals("SELECT t.* NOT SIMILAR TO '^(_PARTITIONDATE|_PARTITIONTIME|_TABLE_SUFFIX)$'"
                         + " FROM \"ds\".\"t\" AS \"t\"",
                 sql("SELECT t.* FROM ds.t t"));
-        assertTrue(assertThrows(GcpException.class, () -> sql("SELECT t.s.* EXCEPT (a) FROM ds.t t"))
-                .getMessage().contains("not supported by the floci BigQuery emulator yet"));
+        assertEquals("SELECT * EXCLUDE (a) FROM (SELECT unnest(t.s) FROM \"ds\".\"t\" AS \"t\")"
+                        + " AS \"_expanded\"",
+                sql("SELECT t.s.* EXCEPT (a) FROM ds.t t"));
         assertEquals("SELECT unnest(f(x).s) FROM \"ds\".\"t\"", sql("SELECT f(x).s.* FROM ds.t"));
         String subscript = sql("SELECT a[OFFSET(0)].s.* FROM ds.t");
         assertTrue(subscript.startsWith("SELECT unnest(") && subscript.endsWith(".s) FROM \"ds\".\"t\"")
                 && !subscript.contains(".*"), subscript);
         String difference = sql("SELECT STRUCT(1 AS a).* EXCEPT DISTINCT SELECT 1 AS a");
         assertTrue(difference.startsWith("SELECT unnest(") && difference.contains(" EXCEPT "), difference);
+    }
+
+    @Test
+    void anyValueStructStarExceptExcludesOnlyRequestedFields() {
+        assertEquals("SELECT * EXCLUDE (omitted) FROM (SELECT unnest(ANY_VALUE(v.original))"
+                        + " FROM \"ds\".\"t\" AS \"v\" GROUP BY v.id) AS \"_expanded\"",
+                sql("SELECT ANY_VALUE(v.original).* EXCEPT (omitted) FROM ds.t v GROUP BY v.id"));
+        assertEquals("SELECT * EXCLUDE (omitted) RENAME (\"_floci_projection_0\" AS \"omitted\")"
+                        + " FROM (SELECT v.group_id, unnest(ANY_VALUE(v.original)),"
+                        + " COUNT(*) AS \"_floci_projection_0\" FROM \"ds\".\"t\" AS \"v\""
+                        + " GROUP BY v.group_id) AS \"_expanded\"",
+                sql("SELECT v.group_id, ANY_VALUE(v.original).* EXCEPT (omitted), COUNT(*) AS omitted"
+                        + " FROM ds.t v GROUP BY v.group_id"));
     }
 
     @Test
@@ -1433,6 +1447,27 @@ class SqlDialectTranslatorTest {
         assertTrue(translated.contains("SELECT {'id': 1}"), translated);
         assertFalse(translated.contains("SELECT AS STRUCT"), translated);
         assertTrue(translated.contains("is out of bounds"), translated);
+    }
+
+    @Test
+    void correlatedSelectAsStructExceptExpandsInTheOuterFromScope() {
+        String translated = sql("SELECT id, (SELECT AS STRUCT input.* EXCEPT(id)) AS original"
+                + " FROM UNNEST([STRUCT(1 AS id, 'keep' AS retained)]) input");
+
+        assertTrue(translated.contains("struct_pack(*COLUMNS(\"_floci_offset_value_0\".* EXCLUDE (\"id\")))"
+                + " AS original"), translated);
+        assertFalse(translated.contains("SELECT struct_pack(*COLUMNS("), translated);
+    }
+
+    @Test
+    void correlatedStructStarExcludesIngestionTimePseudoColumns() {
+        SqlDialectTranslator.TableRef source = new SqlDialectTranslator.TableRef("ds", "partitioned");
+        String translated = SqlDialectTranslator.translate(
+                "SELECT (SELECT AS STRUCT input.* EXCEPT(id)) AS original FROM ds.partitioned input",
+                "test-project", null, SqlDialectTranslator.QueryParameters.none(),
+                ref -> ref.equals(source) ? Set.of("id", "name", "_partitiondate", "_partitiontime") : null).sql();
+
+        assertTrue(translated.contains("EXCLUDE (\"_PARTITIONDATE\", \"_PARTITIONTIME\", \"id\")"), translated);
     }
 
     @Test

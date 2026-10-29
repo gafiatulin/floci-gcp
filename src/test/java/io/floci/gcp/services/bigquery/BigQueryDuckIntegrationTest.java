@@ -832,6 +832,12 @@ class BigQueryDuckIntegrationTest {
                 """).when().post(BASE + "/datasets/shop/tables/reviewed_partition/insertAll")
                 .then().statusCode(200).body("insertErrors", nullValue());
 
+        query(Map.of("query", "SELECT (SELECT AS STRUCT input.* EXCEPT(id)) AS original"
+                        + " FROM shop.reviewed_partition input", "useLegacySql", false))
+                .then().statusCode(200)
+                .body("schema.fields[0].fields.name", equalTo(List.of("name", "secret")))
+                .body("rows[0].f[0].v.f.v", equalTo(List.of("ana", "hidden")));
+
         query(Map.of("query", "CREATE VIEW shop.reviewed_partition_times AS"
                         + " SELECT _PARTITIONTIME AS pt FROM shop.reviewed_partition",
                         "useLegacySql", false))
@@ -1937,11 +1943,23 @@ class BigQueryDuckIntegrationTest {
                 .body("schema.fields.name", equalTo(List.of("a", "b")))
                 .body("rows[0].f.v", equalTo(List.of("1", "x")));
         query("""
+                {"query": "SELECT id, (SELECT AS STRUCT input.* EXCEPT(id)) AS original FROM UNNEST([STRUCT(1 AS id, 'keep' AS retained)]) input", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("id", "original")))
+                .body("rows[0].f[1].v.f[0].v", equalTo("keep"));
+        query("""
                 {"query": "SELECT g, ANY_VALUE(STRUCT(x AS v, x * 10 AS w)).*, MAX(x) m FROM UNNEST([STRUCT('a' AS g, 1 AS x), ('b', 3)]) GROUP BY g ORDER BY g", "useLegacySql": false}
                 """)
                 .then().statusCode(200)
                 .body("schema.fields.name", equalTo(List.of("g", "v", "w", "m")))
                 .body("rows.f.v", equalTo(List.of(List.of("a", "1", "10", "1"), List.of("b", "3", "30", "3"))));
+        query("""
+                {"query": "SELECT v.group_id, ANY_VALUE(v.original).* EXCEPT (omitted), COUNT(*) AS omitted FROM UNNEST([STRUCT(1 AS group_id, STRUCT('drop' AS omitted, 'keep' AS retained) AS original)]) v GROUP BY v.group_id", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("group_id", "retained", "omitted")))
+                .body("rows[0].f.v", equalTo(List.of("1", "keep", "1")));
         query("""
                 {"query": "SELECT t.s.inr.* FROM (SELECT STRUCT(STRUCT(1 AS c, 2 AS d) AS inr) s) t", "useLegacySql": false}
                 """)
