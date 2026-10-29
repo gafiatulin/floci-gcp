@@ -14,16 +14,25 @@ import com.google.cloud.bigquery.storage.v1.GetWriteStreamRequest;
 import com.google.cloud.bigquery.storage.v1.WriteStream;
 import io.floci.gcp.core.common.GcpGrpcController;
 import io.floci.gcp.core.common.RequestScopes;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import io.vertx.core.Context;
+import io.vertx.core.Vertx;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Supplier;
 
 /**
  * gRPC endpoint of the BigQuery Storage Write API. Every call runs with the project of the table
- * it writes to. AppendRows answers each request in order; a rejected append is an in-stream
- * error response, while a malformed connection (no destination) ends the call.
+ * it writes to. AppendRows requests are processed serially on bounded workers because table writes can block;
+ * responses are sent on the original gRPC context. A rejected append is an in-stream error response, while a
+ * malformed connection (no destination) ends the call.
  */
 public class BigQueryWriteController extends BigQueryWriteGrpc.BigQueryWriteImplBase {
+
+    private static final int MAX_PENDING_PER_CONNECTION = 64;
 
     private final BigQueryStorageWrite write;
 
@@ -60,48 +69,186 @@ public class BigQueryWriteController extends BigQueryWriteGrpc.BigQueryWriteImpl
 
     @Override
     public StreamObserver<AppendRowsRequest> appendRows(StreamObserver<AppendRowsResponse> observer) {
-        BigQueryStorageWrite.Connection connection = new BigQueryStorageWrite.Connection();
-        return new StreamObserver<>() {
-            private boolean closed;
+        return new AppendRowsObserver(observer, new BigQueryStorageWrite.Connection(), Vertx.currentContext());
+    }
 
-            @Override
-            public void onNext(AppendRowsRequest request) {
+    private final class AppendRowsObserver implements StreamObserver<AppendRowsRequest> {
+        private final StreamObserver<AppendRowsResponse> observer;
+        private final BigQueryStorageWrite.Connection connection;
+        private final Context grpcContext;
+        private final Deque<AppendRowsRequest> pending = new ArrayDeque<>();
+
+        private boolean closed;
+        private boolean processing;
+        private boolean completionRequested;
+
+        private AppendRowsObserver(StreamObserver<AppendRowsResponse> observer,
+                                   BigQueryStorageWrite.Connection connection, Context grpcContext) {
+            this.observer = observer;
+            this.connection = connection;
+            this.grpcContext = grpcContext;
+        }
+
+        @Override
+        public void onNext(AppendRowsRequest request) {
+            AppendRowsRequest first = null;
+            boolean overloaded = false;
+            synchronized (this) {
+                if (closed || completionRequested) {
+                    return;
+                }
+                if (pending.size() >= MAX_PENDING_PER_CONNECTION || !write.tryAcquireAppendRequestSlot()) {
+                    closed = true;
+                    releasePendingSlots();
+                    overloaded = true;
+                } else {
+                    pending.addLast(request);
+                    if (!processing) {
+                        processing = true;
+                        first = pending.removeFirst();
+                    }
+                }
+            }
+            if (overloaded) {
+                onGrpcContext(() -> observer.onError(Status.RESOURCE_EXHAUSTED
+                        .withDescription("Too many pending BigQuery Storage Write AppendRows requests")
+                        .asRuntimeException()));
+            } else if (first != null) {
+                submit(first);
+            }
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            synchronized (this) {
                 if (closed) {
                     return;
                 }
-                String destination = request.getWriteStream().isEmpty() ? connection.writeStream
-                        : request.getWriteStream();
-                try {
-                    observer.onNext(respond(request, destination));
-                } catch (Throwable t) {
-                    closed = true;
-                    GcpGrpcController.grpcError(observer, t);
-                }
-            }
-
-            private AppendRowsResponse respond(AppendRowsRequest request, String destination) {
-                try {
-                    return RequestScopes.callAs(
-                            destination != null ? BigQueryStorageWrite.projectOf(destination) : null,
-                            () -> write.append(connection, request));
-                } catch (BigQueryStorageWrite.AppendException e) {
-                    return e.toResponse(destination);
-                }
-            }
-
-            @Override
-            public void onError(Throwable t) {
                 closed = true;
+                releasePendingSlots();
             }
+        }
 
-            @Override
-            public void onCompleted() {
-                if (!closed) {
+        @Override
+        public void onCompleted() {
+            boolean complete = false;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                completionRequested = true;
+                if (!processing && pending.isEmpty()) {
                     closed = true;
-                    observer.onCompleted();
+                    complete = true;
                 }
             }
-        };
+            if (complete) {
+                onGrpcContext(observer::onCompleted);
+            }
+        }
+
+        private void submit(AppendRowsRequest request) {
+            try {
+                write.appendExecutor().execute(() -> process(request));
+            } catch (RejectedExecutionException e) {
+                synchronized (this) {
+                    closed = true;
+                    write.releaseAppendRequestSlot();
+                    releasePendingSlots();
+                    processing = false;
+                }
+                onGrpcContext(() -> observer.onError(Status.RESOURCE_EXHAUSTED
+                        .withDescription("BigQuery Storage Write AppendRows executor is full")
+                        .asRuntimeException()));
+            }
+        }
+
+        private void process(AppendRowsRequest request) {
+            AppendRowsResponse response;
+            try {
+                response = respond(request);
+            } catch (Throwable failure) {
+                onGrpcContext(() -> finishRequest(failure));
+                return;
+            }
+            onGrpcContext(() -> {
+                Throwable callbackFailure = null;
+                try {
+                    synchronized (this) {
+                        if (!closed) {
+                            observer.onNext(response);
+                        }
+                    }
+                } catch (Throwable failure) {
+                    callbackFailure = failure;
+                }
+                finishRequest(callbackFailure);
+            });
+        }
+
+        private void finishRequest(Throwable failure) {
+            write.releaseAppendRequestSlot();
+            AppendRowsRequest next = null;
+            int abandoned = 0;
+            boolean complete = false;
+            synchronized (this) {
+                if (failure != null) {
+                    closed = true;
+                }
+                if (closed) {
+                    abandoned = pending.size();
+                    pending.clear();
+                    processing = false;
+                } else if (!pending.isEmpty()) {
+                    next = pending.removeFirst();
+                } else {
+                    processing = false;
+                    if (completionRequested) {
+                        closed = true;
+                        complete = true;
+                    }
+                }
+            }
+            for (int index = 0; index < abandoned; index++) {
+                write.releaseAppendRequestSlot();
+            }
+            if (failure != null) {
+                GcpGrpcController.grpcError(observer, failure);
+            } else if (next != null) {
+                submit(next);
+            } else if (complete) {
+                observer.onCompleted();
+            }
+        }
+
+        private void onGrpcContext(Runnable action) {
+            // The project-context interceptor keeps request scope on the original Vert.x context for the call.
+            if (grpcContext == null || Vertx.currentContext() == grpcContext) {
+                action.run();
+            } else {
+                grpcContext.runOnContext(ignored -> action.run());
+            }
+        }
+
+        private AppendRowsResponse respond(AppendRowsRequest request) {
+            String destination = request.getWriteStream().isEmpty() ? connection.writeStream
+                    : request.getWriteStream();
+            try {
+                return RequestScopes.callAs(
+                        destination != null ? BigQueryStorageWrite.projectOf(destination) : null,
+                        () -> write.append(connection, request));
+            } catch (BigQueryStorageWrite.AppendException e) {
+                return e.toResponse(destination);
+            }
+        }
+
+        private void releasePendingSlots() {
+            int queued = pending.size();
+            pending.clear();
+            for (int index = 0; index < queued; index++) {
+                write.releaseAppendRequestSlot();
+            }
+        }
     }
 
     private static <T> void unary(StreamObserver<T> observer, String name, Supplier<T> action) {

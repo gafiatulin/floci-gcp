@@ -35,6 +35,7 @@ import io.floci.gcp.services.bigquery.model.TableFieldSchema;
 import io.grpc.Status;
 import io.quarkus.runtime.StartupEvent;
 import io.quarkus.runtime.annotations.RegisterForReflection;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
@@ -50,7 +51,14 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -78,6 +86,8 @@ import java.util.regex.Pattern;
 public class BigQueryStorageWrite implements Resettable {
 
     static final String DEFAULT_STREAM = "_default";
+    private static final int APPEND_WORKER_COUNT = 8;
+    private static final int MAX_QUEUED_APPEND_REQUESTS = 512;
 
     private static final Pattern TABLE = Pattern.compile("projects/([^/]+)/datasets/([^/]+)/tables/([^/]+)");
     private static final Pattern STREAM = Pattern.compile(
@@ -188,6 +198,11 @@ public class BigQueryStorageWrite implements Resettable {
     private final EmulatorConfig config;
     private final StorageBackend<String, StoredWriteStream> streamStore;
     private final Map<String, Stream> streams = new ConcurrentHashMap<>();
+    private final Semaphore appendRequestSlots = new Semaphore(MAX_QUEUED_APPEND_REQUESTS);
+    private final ThreadPoolExecutor appendExecutor = new ThreadPoolExecutor(
+            APPEND_WORKER_COUNT, APPEND_WORKER_COUNT, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(MAX_QUEUED_APPEND_REQUESTS), appendThreadFactory(),
+            new ThreadPoolExecutor.AbortPolicy());
     private volatile boolean persistSuppressed;
 
     @Inject
@@ -200,6 +215,32 @@ public class BigQueryStorageWrite implements Resettable {
         // calls do not pass through the REST project filter.
         this.streamStore = storageFactory.createGlobal("bigquery-write-streams", "bigquery-write-streams.json",
                 new TypeReference<Map<String, StoredWriteStream>>() {});
+    }
+
+    @PreDestroy
+    void shutdownAppendExecutor() {
+        appendExecutor.shutdownNow();
+    }
+
+    Executor appendExecutor() {
+        return appendExecutor;
+    }
+
+    boolean tryAcquireAppendRequestSlot() {
+        return appendRequestSlots.tryAcquire();
+    }
+
+    void releaseAppendRequestSlot() {
+        appendRequestSlots.release();
+    }
+
+    private static ThreadFactory appendThreadFactory() {
+        AtomicInteger threadNumber = new AtomicInteger();
+        return runnable -> {
+            Thread thread = new Thread(runnable, "bigquery-write-append-" + threadNumber.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
     }
 
     void onStart(@Observes StartupEvent event) {
