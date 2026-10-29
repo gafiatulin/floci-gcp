@@ -32,6 +32,7 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.time.DateTimeException;
 import java.time.Instant;
@@ -72,6 +73,8 @@ import java.util.stream.Collectors;
 public class BigQueryService {
 
     private static final Logger LOG = Logger.getLogger(BigQueryService.class);
+    private static final Set<String> CLUSTERABLE_FIELD_TYPES = Set.of("BIGNUMERIC", "BOOL", "BOOLEAN", "DATE",
+            "DATETIME", "GEOGRAPHY", "INT64", "INTEGER", "NUMERIC", "RANGE", "STRING", "TIMESTAMP");
 
     private final StorageBackend<String, Dataset> datasetStore;
     private final StorageBackend<String, Table> tableStore;
@@ -982,6 +985,9 @@ public class BigQueryService {
                 }
                 if (statement.kind() == SqlDialectTranslator.StatementKind.CREATE_TABLE
                         && statement.copySource() == null) {
+                    if (statement.options() != null) {
+                        evaluateOptions(projectId, jobProjectId, statement.options(), options, jobLocation);
+                    }
                     Table candidate = createStatementTable(statement,
                             described != null ? described.schema() : null);
                     if (existing.isPresent() && statement.orReplace()
@@ -2362,7 +2368,15 @@ public class BigQueryService {
                         return LocalDateTime.parse(normalized).toInstant(ZoneOffset.UTC)
                                 .truncatedTo(ChronoUnit.MICROS);
                     } catch (DateTimeParseException e) {
-                        throw QueryEngine.invalidQuery("Value cannot be coerced to TIMESTAMP.");
+                        try {
+                            BigDecimal epochMicros = new BigDecimal(normalized).movePointRight(6)
+                                    .setScale(0, RoundingMode.DOWN);
+                            long micros = epochMicros.longValueExact();
+                            return Instant.ofEpochSecond(Math.floorDiv(micros, 1_000_000L),
+                                    Math.floorMod(micros, 1_000_000L) * 1_000L);
+                        } catch (NumberFormatException | DateTimeException | ArithmeticException ignoredEpoch) {
+                            throw QueryEngine.invalidQuery("Value cannot be coerced to TIMESTAMP.");
+                        }
                     }
                 }
             }
@@ -2468,9 +2482,6 @@ public class BigQueryService {
         }
         if (value.matches("[-+]?[0-9]+\\.[0-9]+")) {
             return Double.valueOf(value);
-        }
-        if (value.length() >= 2 && value.startsWith("'") && value.endsWith("'")) {
-            return value.substring(1, value.length() - 1).replace("''", "'");
         }
         Object variable = context.variables().get(value.toLowerCase(Locale.ROOT));
         if (variable == null && !context.variables().containsKey(value.toLowerCase(Locale.ROOT))) {
@@ -3595,6 +3606,14 @@ public class BigQueryService {
         }
     }
 
+    private static void addTotalBytesProcessed(StoredJob job, long bytesProcessed) {
+        if (bytesProcessed <= 0) {
+            return;
+        }
+        long previous = job.getTotalBytesProcessed() != null ? Long.parseLong(job.getTotalBytesProcessed()) : 0L;
+        job.setTotalBytesProcessed(String.valueOf(Math.addExact(previous, bytesProcessed)));
+    }
+
     private static void clearStatementStatistics(StoredJob job) {
         job.setNumDmlAffectedRows(null);
         job.setDmlStats(null);
@@ -3686,7 +3705,7 @@ public class BigQueryService {
                     tables(projectId, jobLocation));
             table.setSchema(result.schema());
             rows = result.rows();
-            job.setTotalBytesProcessed(String.valueOf(result.totalBytesProcessed()));
+            addTotalBytesProcessed(job, result.totalBytesProcessed());
         } else {
             table.setSchema(RowCodec.normalizeSchema(new TableSchema(statement.columns())));
         }
@@ -3696,8 +3715,14 @@ public class BigQueryService {
         if (statement.rangePartitioning() != null) {
             table.getExtra().put("rangePartitioning", new LinkedHashMap<>(statement.rangePartitioning()));
         }
+        applyTableClustering(table, statement.clusteringFields());
+        if (statement.copySource() == null && statement.options() != null) {
+            applyTableOptions(table, evaluateOptions(projectId, jobProjectId, statement.options(), options,
+                    jobLocation));
+        }
         BigQueryMetadata.validateTable(table.getExtra(), schemaFields(table));
         validateCreateTablePartitioning(statement, table);
+        validateCreateTableClustering(statement, table);
         synchronized (writeLock) {
             Dataset currentDestinationDataset = getDataset(projectId, target.datasetId());
             Optional<Table> currentTable = tableStore.get(tableKey(target.datasetId(), target.tableId()));
@@ -3756,9 +3781,35 @@ public class BigQueryService {
         if (statement.rangePartitioning() != null) {
             table.getExtra().put("rangePartitioning", new LinkedHashMap<>(statement.rangePartitioning()));
         }
+        applyTableClustering(table, statement.clusteringFields());
         BigQueryMetadata.validateTable(table.getExtra(), schemaFields(table));
         validateCreateTablePartitioning(statement, table);
+        validateCreateTableClustering(statement, table);
         return table;
+    }
+
+    private static void validateCreateTableClustering(SqlDialectTranslator.Statement statement, Table table) {
+        if (statement.clusteringFields() == null) {
+            return;
+        }
+        List<TableFieldSchema> fields = schemaFields(table);
+        for (String clusteringField : statement.clusteringFields()) {
+            TableFieldSchema field = fields.stream()
+                    .filter(candidate -> candidate.getName() != null
+                            && candidate.getName().equalsIgnoreCase(clusteringField))
+                    .findFirst().orElse(null);
+            if (field == null || "REPEATED".equals(field.getMode())
+                    || field.getType() == null || !CLUSTERABLE_FIELD_TYPES.contains(field.getType().toUpperCase(Locale.ROOT))) {
+                throw QueryEngine.invalidQuery("CLUSTER BY field " + clusteringField
+                        + " must be a top-level, non-repeated column with a clusterable type.");
+            }
+        }
+    }
+
+    private static void applyTableClustering(Table table, List<String> fields) {
+        if (fields != null) {
+            table.getExtra().put("clustering", Map.of("fields", fields));
+        }
     }
 
     private static void validateCreateTablePartitioning(SqlDialectTranslator.Statement statement, Table table) {
